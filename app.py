@@ -18,7 +18,6 @@ from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-
 # ==========================================
 # 1. LOAD ENVIRONMENT VARIABLES
 # ==========================================
@@ -2009,9 +2008,9 @@ async def home(request: Request):
 
 @app.get("/health")
 def health():
-
     return {
-        "status": "running"
+        "status": "healthy",
+        "message": "Gemini Tax Dashboard is running"
     }
 
 # =====================================================

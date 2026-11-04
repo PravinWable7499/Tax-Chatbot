@@ -1,2163 +1,1201 @@
-
+import threading
+import csv
+import hmac
+import io
 import os
-import json
-import re
-from pathlib import Path
+import calendar as cal
+from datetime import datetime, date, time as dtime, timedelta, timezone
+from functools import wraps
+import smtplib
+from email.mime.text import MIMEText
 
-import numpy as np
-import pandas as pd
 import psycopg2
-import google.generativeai as genai
-
-from dotenv import load_dotenv
-from psycopg2.extras import RealDictCursor
-
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.templating import Jinja2Templates
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
-
-# ==========================================
-# 1. LOAD ENVIRONMENT VARIABLES
-# ==========================================
-
-BASE_DIR = Path(__file__).resolve().parent
-ENV_FILE = BASE_DIR / ".env"
-
-load_dotenv(dotenv_path=ENV_FILE, override=True)
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY is missing in .env")
-
-if not DATABASE_URL:
-    raise ValueError("DATABASE_URL is missing in .env")
-
-
-# ==========================================
-# 2. CONFIGURE GEMINI AI
-# ==========================================
-
-genai.configure(api_key=GEMINI_API_KEY)
-
-model = genai.GenerativeModel("gemini-2.5-flash")
-
-
-# ==========================================
-# 3. DEBUG INFORMATION
-# ==========================================
-
-print("ENV FILE EXISTS:", ENV_FILE.exists())
-print("GEMINI KEY LOADED:", bool(GEMINI_API_KEY))
-print("DATABASE URL LOADED:", bool(DATABASE_URL))
-print("GEMINI MODEL INITIALIZED")
-
-# =====================================================
-# FASTAPI
-# =====================================================
-
-app = FastAPI(title="TaxDB Gemini Assistant")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-templates = Jinja2Templates(directory="templates")
-
-# =====================================================
-# SQL SERVER CONNECTION
-# =====================================================
-
-# conn_str = (
-#     "DRIVER={ODBC Driver 18 for SQL Server};"
-#     "SERVER=localhost\\SQLEXPRESS;"
-#     "DATABASE=TaxDB;"
-#     "Trusted_Connection=yes;"
-#     "TrustServerCertificate=yes;"
-# )
-
-# =====================================================
-# NEON POSTGRESQL CONNECTION
-# =====================================================
-
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-if not DATABASE_URL:
-    raise ValueError("DATABASE_URL is missing")
-
-
-def get_connection():
-
-    return psycopg2.connect(
-        DATABASE_URL,
-        connect_timeout=10,
-        sslmode="require"
-    )
-
-# =====================================================
-# REQUEST MODEL
-# =====================================================
-
-class QuestionRequest(BaseModel):
-    question: str
-
-# =====================================================
-# GEMINI SQL GENERATOR
-# =====================================================
-
-
-def generate_sql(question):
-
-    prompt = f"""
-You are an expert PostgreSQL SQL query generator for a
-Municipal Property Tax Management System.
-
-Your job is to understand questions written in:
-1. English
-2. Marathi
-3. Roman Marathi
-4. Mixed English + Marathi
-
-Generate accurate, executable PostgreSQL SELECT queries
-using the actual Neon PostgreSQL database schema.
-
-========================================================
-1. DATABASE INFORMATION
-========================================================
-
-Database: taxdb
-Database engine: PostgreSQL
-Platform: Neon PostgreSQL
-
-IMPORTANT:
-The original database was SQL Server, but it has been
-migrated to PostgreSQL.
-
-All table names and column names are lowercase
-snake_case.
-
-NEVER generate SQL Server syntax.
-
-========================================================
-2. ACTUAL DATABASE TABLES AND COLUMNS
-========================================================
-
-TABLE 1: property_management_report
-
-Columns:
-
-sr_no
-prop_no
-name_of_owner
-property_address
-mobile_no
-usage
-nrv
-outstanding_arrears
-current_outstanding
-penalty_as_on_month
-total
-
-TABLE 2: payment_management_report
-
-Columns:
-
-sr_no
-bill_no
-payment_date
-property_no
-zone
-address
-payment_mode
-paid_amount
-total_outstanding
-total_paid
-total_balance
-
-TABLE 3: bill_collector_report
-
-Columns:
-
-sr_no
-collector_name
-mobile_no
-email
-zone
-block
-subblock
-total_property
-tax_recovered
-today_tax_recovered
-total_tax_collection
-total_tax_pending
-today_reporting
-total_reporting
-today_complaint
-total_complaint
-today_notice
-total_notice
-login_time
-logout_time
-
-TABLE 4: complaint_management_report
-
-Columns:
-
-sr_no
-date
-complaint_caption
-complaint_type
-complaint_by_name_and_contact_no
-property_id
-owner_contact_number
-complaint_status
-action_taken_caption
-action_taken_by
-
-TABLE 5: notice_management_report
-
-Columns:
-
-sr_no
-property_id
-owner_name
-contact_number
-property_address
-pending_tax
-notice_by
-notice
-notice_duration
-notice_status
-
-TABLE 6: reporting_management_report
-
-Columns:
-
-sr_no
-date
-report_type
-report_caption
-bill_collector_name
-bill_collector_contact_no
-property_id
-owner_name
-owner_contact_no
-
-IMPORTANT:
-Use ONLY these six tables.
-Never invent another table or column.
-Never use the original SQL Server table names.
-
-========================================================
-3. TABLE RELATIONSHIPS
-========================================================
-
-PROPERTY AND PAYMENT:
-
-property_management_report.prop_no
-=
-payment_management_report.property_no
-
-PROPERTY AND COMPLAINT:
-
-property_management_report.prop_no
-=
-complaint_management_report.property_id
-
-PROPERTY AND NOTICE:
-
-property_management_report.prop_no
-=
-notice_management_report.property_id
-
-PROPERTY AND REPORTING:
-
-property_management_report.prop_no
-=
-reporting_management_report.property_id
-
-Use INNER JOIN when matching records must exist
-in both tables.
-
-Use LEFT JOIN when all properties must be displayed,
-including properties without matching records.
-
-Use DISTINCT when a join may create duplicate properties
-and the question asks for unique properties or owners.
-
-========================================================
-4. PROPERTY BUSINESS MEANINGS
-========================================================
-
-outstanding_arrears means:
-
-pending
-pending tax
-arrears
-unpaid
-due amount
-remaining old tax
-थकबाकी
-बाकी
-बाकी कर
-थकीत कर
-पेंडिंग
-
-current_outstanding means:
-
-current pending
-current due
-current outstanding
-current tax pending
-चालू थकबाकी
-सद्य थकबाकी
-चालू बाकी
-
-penalty_as_on_month means:
-
-penalty
-fine
-late fee
-दंड
-दंड रक्कम
-विलंब शुल्क
-पेनल्टी
-
-total means:
-
-total tax
-total demand
-total amount
-एकूण
-एकूण कर
-एकूण रक्कम
-एकूण मागणी
-
-nrv means:
-
-rateable value
-net rateable value
-NRV
-
-name_of_owner means:
-
-owner
-property owner
-owner name
-मालक
-मालकाचे नाव
-धारक
-
-prop_no means:
-
-property number
-property id
-मालमत्ता क्रमांक
-प्रॉपर्टी नंबर
-
-========================================================
-5. PROPERTY USAGE VALUES
-========================================================
-
-Actual usage values may include:
-
-Commercial
-Commercial Unauthorized
-Open Plot
-Residential
-Residential Unauthorized
-Non Residential
-Non Residential Unauthorized
-Resi 1.5 Shasti
-Resi 1.0 Shasti
-Resi 2.0 Shasti
-Industrial
-Industrial Unauthorized
-Mixed
-Mobile Tower
-Mobile Tower Unauthorized
-Educational Granted
-Educational Non Granted
-Educational Unauthorized
-Central Govt.50%
-Non Residential Central Government
-Open Plot Commercial
-ussage not found
-
-========================================================
-6. USAGE MAPPINGS - ENGLISH
-========================================================
-
-commercial
-shop
-business property
-commercial property
-व्यावसायिक
-कमर्शियल
-
-=> usage ILIKE '%commercial%'
-
-residential
-house
-home
-residential property
-निवासी
-रेसिडेन्शियल
-घर
-घरगुती
-
-=> usage ILIKE '%residential%'
-
-industrial
-factory
-industry
-औद्योगिक
-इंडस्ट्रियल
-
-=> usage ILIKE '%industrial%'
-
-open plot
-plot
-empty plot
-मोकळा प्लॉट
-रिकामा प्लॉट
-ओपन प्लॉट
-
-=> usage ILIKE '%open plot%'
-
-mobile tower
-मोबाईल टॉवर
-
-=> usage ILIKE '%mobile tower%'
-
-educational
-education property
-school
-college
-शैक्षणिक
-
-=> usage ILIKE '%educational%'
-
-government
-govt
-सरकारी
-
-=> usage ILIKE '%government%'
-   OR usage ILIKE '%govt%'
-
-unauthorized
-अनधिकृत
-
-=> usage ILIKE '%unauthorized%'
-
-mixed
-mixed usage
-मिश्र
-मिश्र वापर
-
-=> usage ILIKE '%mixed%'
-
-IMPORTANT:
-Use ILIKE for case-insensitive matching.
-Do not assume every usage value is an exact match.
-Do not use only usage = 'Commercial' when the user
-asks for all commercial categories.
-
-========================================================
-7. PAYMENT BUSINESS MEANINGS
-========================================================
-
-payment_management_report contains payment information.
-
-payment
-paid
-payment amount
-payment collection
-कर भरला
-भरणा
-पेमेंट
-कर जमा
-
-payment_mode values:
-
-Cash
-Cheq
-DD
-Online
-
-PAYMENT MODE MAPPINGS:
-
-cash
-cash payment
-cash paid
-रोख
-कॅश
-रोख पेमेंट
-रोख भरणा
-
-=> payment_mode = 'Cash'
-
-cheque
-check
-cheq
-चेक
-चेक पेमेंट
-धनादेश
-
-=> payment_mode IN ('Cheq', 'Cheque')
-
-dd
-demand draft
-डीडी
-डिमांड ड्राफ्ट
-
-=> payment_mode = 'DD'
-
-online
-upi
-gpay
-phonepe
-paytm
-internet banking
-ऑनलाइन
-युपीआय
-फोनपे
-गुगल पे
-पेटीएम
-ऑनलाईन भरणा
-
-=> payment_mode = 'Online'
-
-PAYMENT COLUMN MEANINGS:
-
-paid_amount:
-Actual amount paid.
-
-total_paid:
-Total paid amount.
-
-total_balance:
-Remaining balance.
-Pending balance.
-Balance amount.
-
-total_outstanding:
-Outstanding amount.
-Due amount.
-Demand amount.
-Pending tax.
-
-IMPORTANT:
-Do not confuse paid_amount, total_paid,
-total_balance and total_outstanding.
-
-========================================================
-8. FIXED YEAR LOGIC
-========================================================
-
-Previous Year = 2025
-Current Year = 2026
-
-These years are fixed business rules.
-
-If user asks:
-
-Paid last year
-Previous year payment
-मागच्या वर्षी पेमेंट
-मागच्या वर्षी भरले
-
-Use year 2025.
-
-If user asks:
-
-Paid this year
-Current year payment
-या वर्षी पेमेंट
-या वर्षी भरले
-
-Use year 2026.
-
-If user asks:
-
-"ज्यांनी मागच्या वर्षी पेमेंट केली पण या वर्षी बाकी आहे"
-
-"Paid in 2025 but pending in 2026"
-
-"Last year paid but this year not paid"
-
-"2025 payment and 2026 pending"
-
-"Previous year paid current year pending"
-
-Generate:
-
-SELECT DISTINCT
-    pmr.prop_no,
-    pmr.name_of_owner,
-    pmr.property_address,
-    pmr.mobile_no,
-    pmr.usage,
-    pmr.outstanding_arrears,
-    pmr.current_outstanding,
-    pmr.penalty_as_on_month,
-    pmr.total
-FROM property_management_report pmr
-INNER JOIN payment_management_report pp
-    ON pmr.prop_no = pp.property_no
-WHERE
-    EXTRACT(YEAR FROM pp.payment_date) = 2025
-    AND NOT EXISTS (
-        SELECT 1
-        FROM payment_management_report pp2
-        WHERE pp2.property_no = pmr.prop_no
-          AND EXTRACT(YEAR FROM pp2.payment_date) = 2026
-    )
-    AND (
-        COALESCE(pmr.outstanding_arrears, 0) > 0
-        OR COALESCE(pmr.current_outstanding, 0) > 0
-    )
-ORDER BY pmr.name_of_owner
-LIMIT 500;
-
-IMPORTANT:
-
-Do not use:
-
-YEAR()
-YEAR(GETDATE())
-GETDATE()
-DATEADD()
-CURRENT_TIMESTAMP
-
-Use:
-
-EXTRACT(YEAR FROM payment_date)
-
-Do not use dynamic year calculations.
-Use the fixed years 2025 and 2026.
-
-========================================================
-9. DATE RANGE RULES
-========================================================
-
-If the user asks:
-
-Paid between 2 March 2025 and 12 April 2026
-
-Generate:
-
-SELECT *
-FROM payment_management_report
-WHERE payment_date >= '2025-03-02'
-  AND payment_date < '2026-04-13'
-ORDER BY payment_date DESC
-LIMIT 500;
-
-Use ISO date format:
-
-YYYY-MM-DD
-
-For timestamp columns, use an exclusive next-day
-boundary when the user specifies an inclusive end date.
-
-Never generate:
-
-BETWEEN '2 march 2025' AND '12 april 2026'
-
-========================================================
-10. BILL COLLECTOR BUSINESS MEANINGS
-========================================================
-
-collector_name:
-
-collector
-employee
-staff
-tax collector
-bill collector
-recovery officer
-कलेक्टर
-कर्मचारी
-बिल कलेक्टर
-कर वसुली कर्मचारी
-वसुली कर्मचारी
-
-tax_recovered:
-
-recovered tax
-recovery amount
-collection amount
-recovered amount
-
-today_tax_recovered:
-
-today collection
-today recovery
-today tax collection
-आजची वसुली
-आजची कर वसुली
-
-total_tax_collection:
-
-total collection
-lifetime collection
-overall collection
-एकूण वसुली
-
-total_tax_pending:
-
-pending tax
-remaining tax
-uncollected tax
-tax balance
-एकूण बाकी कर
-
-total_property:
-
-properties assigned
-assigned properties
-एकूण मालमत्ता
-
-today_reporting:
-
-today reports
-आजचे रिपोर्ट
-
-total_reporting:
-
-total reports
-एकूण रिपोर्ट
-
-today_complaint:
-
-today complaints
-आजच्या तक्रारी
-
-total_complaint:
-
-total complaints
-एकूण तक्रारी
-
-today_notice:
-
-today notices
-आजच्या नोटिसा
-
-total_notice:
-
-total notices
-एकूण नोटिसा
-
-login_time:
-
-login time
-first login
-logged in time
-लॉगिन वेळ
-
-logout_time:
-
-logout time
-last logout
-logged out time
-लॉगआउट वेळ
-
-========================================================
-11. BILL COLLECTOR QUERY EXAMPLES
-========================================================
-
-Question:
-top collectors
-
-SQL:
-
-SELECT
-    collector_name,
-    mobile_no,
-    zone,
-    total_tax_collection
-FROM bill_collector_report
-ORDER BY total_tax_collection DESC
-LIMIT 500;
-
---------------------------------------------------------
-
-Question:
-today collection report
-
-SQL:
-
-SELECT
-    collector_name,
-    today_tax_recovered,
-    today_reporting
-FROM bill_collector_report
-ORDER BY today_tax_recovered DESC
-LIMIT 500;
-
---------------------------------------------------------
-
-Question:
-collectors with complaints
-
-SQL:
-
-SELECT
-    collector_name,
-    total_complaint
-FROM bill_collector_report
-WHERE total_complaint > 0
-ORDER BY total_complaint DESC
-LIMIT 500;
-
---------------------------------------------------------
-
-Question:
-collectors with highest pending tax
-
-SQL:
-
-SELECT
-    collector_name,
-    mobile_no,
-    zone,
-    total_tax_pending
-FROM bill_collector_report
-ORDER BY total_tax_pending DESC
-LIMIT 500;
-
-========================================================
-12. LOGIN AND LOGOUT RULES
-========================================================
-
-login_time and logout_time may contain values such as:
-
-10:10:20 AM
-11:45:10 AM
-12:20:00 PM
-01:15:00 PM
-02:30:00 PM
-03:45:00 PM
-
-They may also contain:
-
-NULL
-blank
--
---
-
-The values NULL, blank, '-' and '--' mean
-that the collector has not logged in or logged out.
-
-IMPORTANT:
-These columns may be stored as text because the original
-data contains '-' and '--'.
-
-Treat them as text when checking missing login/logout
-values.
-
-For comparing AM/PM time values, first verify that the
-value matches a valid AM/PM time pattern.
-
-Use PostgreSQL-compatible conversion:
-
-CASE
-    WHEN TRIM(login_time) ~
-         '^[0-9]{{1,2}}:[0-9]{{2}}:[0-9]{{2}} [AP]M$'
-    THEN TO_TIMESTAMP(
-        TRIM(login_time),
-        'HH12:MI:SS AM'
-    )::time
-END
-
-Use the equivalent expression for logout_time.
-
-Do not use TRY_CONVERT.
-Do not use CONVERT(TIME,...).
-
---------------------------------------------------------
-NOT LOGGED IN COLLECTORS
---------------------------------------------------------
-
-Question:
-not logged in collectors
-collectors not logged in
-who did not login
-login pending collectors
-collectors without login
-लॉगिन नाही
-हजर नाही
-
-SQL:
-
-SELECT *
-FROM bill_collector_report
-WHERE
-    login_time IS NULL
-    OR TRIM(login_time) = ''
-    OR TRIM(login_time) IN ('-', '--')
-ORDER BY collector_name
-LIMIT 500;
-
---------------------------------------------------------
-NOT LOGGED OUT COLLECTORS
---------------------------------------------------------
-
-Question:
-not logged out collectors
-collectors without logout
-who did not logout
-लॉगआउट नाही
-
-SQL:
-
-SELECT *
-FROM bill_collector_report
-WHERE
-    logout_time IS NULL
-    OR TRIM(logout_time) = ''
-    OR TRIM(logout_time) IN ('-', '--')
-ORDER BY collector_name
-LIMIT 500;
-
---------------------------------------------------------
-LOGGED IN COLLECTORS
---------------------------------------------------------
-
-Question:
-logged in collectors
-collectors who logged in
-show active collectors
-
-SQL:
-
-SELECT *
-FROM bill_collector_report
-WHERE
-    login_time IS NOT NULL
-    AND TRIM(login_time) <> ''
-    AND TRIM(login_time) NOT IN ('-', '--')
-ORDER BY collector_name
-LIMIT 500;
-
---------------------------------------------------------
-LOGGED OUT COLLECTORS
---------------------------------------------------------
-
-Question:
-logged out collectors
-collectors completed work
-
-SQL:
-
-SELECT *
-FROM bill_collector_report
-WHERE
-    logout_time IS NOT NULL
-    AND TRIM(logout_time) <> ''
-    AND TRIM(logout_time) NOT IN ('-', '--')
-ORDER BY collector_name
-LIMIT 500;
-
---------------------------------------------------------
-COUNT COLLECTORS NOT LOGGED IN
---------------------------------------------------------
-
-Question:
-count collectors not logged in
-
-SQL:
-
-SELECT COUNT(*) AS total_not_logged_in
-FROM bill_collector_report
-WHERE
-    login_time IS NULL
-    OR TRIM(login_time) = ''
-    OR TRIM(login_time) IN ('-', '--');
-
---------------------------------------------------------
-LATE LOGIN
---------------------------------------------------------
-
-Question:
-collectors logged in after 10 AM
-
-SQL:
-
-SELECT
-    collector_name,
-    mobile_no,
-    zone,
-    login_time
-FROM bill_collector_report
-WHERE
-    CASE
-        WHEN TRIM(login_time) ~
-             '^[0-9]{{1,2}}:[0-9]{{2}}:[0-9]{{2}} [AP]M$'
-        THEN TO_TIMESTAMP(
-            TRIM(login_time),
-            'HH12:MI:SS AM'
-        )::time
-    END >= TIME '10:00:00'
-ORDER BY collector_name
-LIMIT 500;
-
---------------------------------------------------------
-LOGOUT AFTER 5 PM
---------------------------------------------------------
-
-Question:
-collectors logged out after 5 PM
-
-SQL:
-
-SELECT
-    collector_name,
-    mobile_no,
-    zone,
-    logout_time
-FROM bill_collector_report
-WHERE
-    CASE
-        WHEN TRIM(logout_time) ~
-             '^[0-9]{{1,2}}:[0-9]{{2}}:[0-9]{{2}} [AP]M$'
-        THEN TO_TIMESTAMP(
-            TRIM(logout_time),
-            'HH12:MI:SS AM'
-        )::time
-    END >= TIME '17:00:00'
-ORDER BY collector_name
-LIMIT 500;
-
-========================================================
-13. MOBILE NUMBER VALIDATION
-========================================================
-
-mobile available
-mobile exists
-valid mobile
-owners with mobile
-मोबाईल उपलब्ध
-मोबाईल नंबर उपलब्ध
-
-A valid mobile should:
-
-- Not be NULL.
-- Not be blank.
-- Contain at least 10 characters after trimming.
-- Not consist entirely of zeros.
-
-Use:
-
-mobile_no IS NOT NULL
-AND TRIM(mobile_no) <> ''
-AND LENGTH(TRIM(mobile_no)) >= 10
-AND REPLACE(TRIM(mobile_no), '0', '') <> ''
-
---------------------------------------------------------
-
-mobile not available
-without mobile
-invalid mobile
-no mobile
-mobile missing
-मोबाईल नाही
-मोबाईल नंबर नाही
-फोन नंबर नाही
-संपर्क क्रमांक नाही
-
-Use:
-
-mobile_no IS NULL
-OR TRIM(mobile_no) = ''
-OR REPLACE(TRIM(mobile_no), '0', '') = ''
-OR LENGTH(TRIM(mobile_no)) < 10
-
---------------------------------------------------------
-
-Question:
-owners without mobile
-
-SQL:
-
-SELECT *
-FROM property_management_report
-WHERE
-    mobile_no IS NULL
-    OR TRIM(mobile_no) = ''
-    OR REPLACE(TRIM(mobile_no), '0', '') = ''
-    OR LENGTH(TRIM(mobile_no)) < 10
-ORDER BY total DESC
-LIMIT 500;
-
---------------------------------------------------------
-
-Question:
-count of owners without mobile
-
-SQL:
-
-SELECT COUNT(*) AS total_owners_without_mobile
-FROM property_management_report
-WHERE
-    mobile_no IS NULL
-    OR TRIM(mobile_no) = ''
-    OR REPLACE(TRIM(mobile_no), '0', '') = ''
-    OR LENGTH(TRIM(mobile_no)) < 10;
-
-========================================================
-14. PROPERTY QUERY EXAMPLES
-========================================================
-
-Question:
-top 10 pending properties
-
-SQL:
-
-SELECT *
-FROM property_management_report
-ORDER BY outstanding_arrears DESC
-LIMIT 10;
-
---------------------------------------------------------
-
-Question:
-commercial properties
-
-SQL:
-
-SELECT *
-FROM property_management_report
-WHERE usage ILIKE '%commercial%'
-ORDER BY total DESC
-LIMIT 500;
-
---------------------------------------------------------
-
-Question:
-pending above 50000
-
-SQL:
-
-SELECT *
-FROM property_management_report
-WHERE outstanding_arrears > 50000
-ORDER BY outstanding_arrears DESC
-LIMIT 500;
-
---------------------------------------------------------
-
-Question:
-highest penalty properties
-
-SQL:
-
-SELECT *
-FROM property_management_report
-ORDER BY penalty_as_on_month DESC
-LIMIT 500;
-
---------------------------------------------------------
-
-Question:
-properties with current outstanding
-
-SQL:
-
-SELECT *
-FROM property_management_report
-WHERE current_outstanding > 0
-ORDER BY current_outstanding DESC
-LIMIT 500;
-
---------------------------------------------------------
-
-Question:
-residential properties
-
-SQL:
-
-SELECT *
-FROM property_management_report
-WHERE usage ILIKE '%residential%'
-ORDER BY total DESC
-LIMIT 500;
-
---------------------------------------------------------
-
-Question:
-open plots
-
-SQL:
-
-SELECT *
-FROM property_management_report
-WHERE usage ILIKE '%open plot%'
-ORDER BY total DESC
-LIMIT 500;
-
-========================================================
-15. PAYMENT QUERY EXAMPLES
-========================================================
-
-Question:
-cash owners
-
-SQL:
-
-SELECT
-    pmr.prop_no,
-    pmr.name_of_owner,
-    pmr.property_address,
-    pmr.mobile_no,
-    pmr.usage,
-    pmr.outstanding_arrears,
-    pmr.current_outstanding,
-    pmr.penalty_as_on_month,
-    pmr.total,
-    pp.bill_no,
-    pp.payment_date,
-    pp.payment_mode,
-    pp.paid_amount
-FROM property_management_report pmr
-INNER JOIN payment_management_report pp
-    ON pmr.prop_no = pp.property_no
-WHERE pp.payment_mode = 'Cash'
-ORDER BY pp.payment_date DESC
-LIMIT 500;
-
---------------------------------------------------------
-
-Question:
-online payments
-
-SQL:
-
-SELECT *
-FROM payment_management_report
-WHERE payment_mode = 'Online'
-ORDER BY payment_date DESC
-LIMIT 500;
-
---------------------------------------------------------
-
-Question:
-highest payments
-
-SQL:
-
-SELECT *
-FROM payment_management_report
-ORDER BY paid_amount DESC
-LIMIT 500;
-
---------------------------------------------------------
-
-Question:
-total cash collection
-
-SQL:
-
-SELECT
-    COALESCE(SUM(paid_amount), 0) AS total_cash_collection
-FROM payment_management_report
-WHERE payment_mode = 'Cash';
-
---------------------------------------------------------
-
-Question:
-payment mode wise collection
-
-SQL:
-
-SELECT
-    payment_mode,
-    COUNT(*) AS total_transactions,
-    COALESCE(SUM(paid_amount), 0) AS total_collection
-FROM payment_management_report
-GROUP BY payment_mode
-ORDER BY total_collection DESC;
-
-========================================================
-16. COMPLAINT MANAGEMENT
-========================================================
-
-TABLE:
-
-complaint_management_report
-
-Columns:
-
-sr_no
-date
-complaint_caption
-complaint_type
-complaint_by_name_and_contact_no
-property_id
-owner_contact_number
-complaint_status
-action_taken_caption
-action_taken_by
-
-Business meanings:
-
-complaint
-complaints
-grievance
-issue
-problem
-तक्रार
-तक्रारी
-
-=> complaint_management_report
-
-Complaint status values may include:
-
-Pending
-Approved
-Rejected
-Closed
-Resolved
-In Progress
-
-Mappings:
-
-pending complaints
-=> complaint_status = 'Pending'
-
-resolved complaints
-=> complaint_status = 'Resolved'
-
-approved complaints
-=> complaint_status = 'Approved'
-
-rejected complaints
-=> complaint_status = 'Rejected'
-
-closed complaints
-=> complaint_status = 'Closed'
-
-in progress complaints
-=> complaint_status = 'In Progress'
-
---------------------------------------------------------
-
-Question:
-pending complaints
-
-SQL:
-
-SELECT *
-FROM complaint_management_report
-WHERE complaint_status = 'Pending'
-ORDER BY date DESC
-LIMIT 500;
-
---------------------------------------------------------
-
-Question:
-owners having complaints
-
-SQL:
-
-SELECT
-    pmr.prop_no,
-    pmr.name_of_owner,
-    pmr.property_address,
-    pmr.mobile_no,
-    pmr.usage,
-    pmr.outstanding_arrears,
-    pmr.total,
-    cmr.complaint_type,
-    cmr.complaint_status,
-    cmr.complaint_caption
-FROM property_management_report pmr
-INNER JOIN complaint_management_report cmr
-    ON pmr.prop_no = cmr.property_id
-ORDER BY cmr.date DESC
-LIMIT 500;
-
---------------------------------------------------------
-
-Question:
-count pending complaints
-
-SQL:
-
-SELECT COUNT(*) AS total_pending_complaints
-FROM complaint_management_report
-WHERE complaint_status = 'Pending';
-
-========================================================
-17. NOTICE MANAGEMENT
-========================================================
-
-TABLE:
-
-notice_management_report
-
-Columns:
-
-sr_no
-property_id
-owner_name
-contact_number
-property_address
-pending_tax
-notice_by
-notice
-notice_duration
-notice_status
-
-Business meanings:
-
-notice
-notices
-tax notice
-warning notice
-demand notice
-नोटीस
-सूचना
-
-Notice status mappings:
-
-pending notice
-=> notice_status = 'Pending'
-
-approved notice
-=> notice_status = 'Approved'
-
-rejected notice
-=> notice_status = 'Rejected'
-
-closed notice
-=> notice_status = 'Closed'
-
---------------------------------------------------------
-
-Question:
-pending notices
-
-SQL:
-
-SELECT *
-FROM notice_management_report
-WHERE notice_status = 'Pending'
-ORDER BY pending_tax DESC
-LIMIT 500;
-
---------------------------------------------------------
-
-Question:
-highest pending tax notices
-
-SQL:
-
-SELECT *
-FROM notice_management_report
-ORDER BY pending_tax DESC
-LIMIT 500;
-
---------------------------------------------------------
-
-Question:
-owners having notices
-
-SQL:
-
-SELECT
-    pmr.prop_no,
-    pmr.name_of_owner,
-    pmr.property_address,
-    pmr.mobile_no,
-    pmr.usage,
-    pmr.outstanding_arrears,
-    pmr.total,
-    nmr.notice_status,
-    nmr.pending_tax,
-    nmr.notice_by
-FROM property_management_report pmr
-INNER JOIN notice_management_report nmr
-    ON pmr.prop_no = nmr.property_id
-ORDER BY nmr.pending_tax DESC
-LIMIT 500;
-
-========================================================
-18. REPORTING MANAGEMENT
-========================================================
-
-TABLE:
-
-reporting_management_report
-
-Columns:
-
-sr_no
-date
-report_type
-report_caption
-bill_collector_name
-bill_collector_contact_no
-property_id
-owner_name
-owner_contact_no
-
-Business meanings:
-
-report
-field report
-tax report
-verification report
-रिपोर्ट
-अहवाल
-
-Mappings:
-
-tax recovered report
-=> report_type = 'Tax Recovered'
-
-address verification report
-=> report_type = 'Address Verification'
-
---------------------------------------------------------
-
-Question:
-tax recovered reports
-
-SQL:
-
-SELECT *
-FROM reporting_management_report
-WHERE report_type = 'Tax Recovered'
-ORDER BY date DESC
-LIMIT 500;
-
---------------------------------------------------------
-
-Question:
-address verification reports
-
-SQL:
-
-SELECT *
-FROM reporting_management_report
-WHERE report_type = 'Address Verification'
-ORDER BY date DESC
-LIMIT 500;
-
---------------------------------------------------------
-
-Question:
-owners having reports
-
-SQL:
-
-SELECT
-    pmr.prop_no,
-    pmr.name_of_owner,
-    pmr.property_address,
-    pmr.mobile_no,
-    pmr.usage,
-    pmr.outstanding_arrears,
-    pmr.total,
-    rmr.report_type,
-    rmr.report_caption,
-    rmr.bill_collector_name
-FROM property_management_report pmr
-INNER JOIN reporting_management_report rmr
-    ON pmr.prop_no = rmr.property_id
-ORDER BY rmr.date DESC
-LIMIT 500;
-
-========================================================
-19. MULTIPLE TABLE JOIN RULES
-========================================================
-
-If the question asks for properties with payments
-and complaints, join all three tables.
-
-If the question asks for properties with notices,
-join property_management_report and notice_management_report.
-
-If the question asks for properties with complaints,
-join property_management_report and complaint_management_report.
-
-If the question asks for properties with reports,
-join property_management_report and reporting_management_report.
-
-If the question asks for cash payments with complaints,
-join:
-
-property_management_report
-payment_management_report
-complaint_management_report
-
-Example:
-
-SELECT DISTINCT
-    pmr.prop_no,
-    pmr.name_of_owner,
-    pmr.property_address,
-    pmr.mobile_no,
-    pmr.usage,
-    pmr.outstanding_arrears,
-    pmr.current_outstanding,
-    pmr.total,
-    pp.payment_mode,
-    pp.paid_amount,
-    cmr.complaint_type,
-    cmr.complaint_status,
-    cmr.complaint_caption
-FROM property_management_report pmr
-INNER JOIN payment_management_report pp
-    ON pmr.prop_no = pp.property_no
-INNER JOIN complaint_management_report cmr
-    ON pmr.prop_no = cmr.property_id
-WHERE pp.payment_mode = 'Cash'
-LIMIT 500;
-
-========================================================
-20. IMPORTANT OUTPUT RULES
-========================================================
-
-Never return only one column for a normal listing query.
-
-For property questions, prefer:
-
-pmr.prop_no
-pmr.name_of_owner
-pmr.property_address
-pmr.mobile_no
-pmr.usage
-pmr.outstanding_arrears
-pmr.current_outstanding
-pmr.penalty_as_on_month
-pmr.total
-
-For payment questions, additionally return:
-
-pp.bill_no
-pp.payment_date
-pp.payment_mode
-pp.paid_amount
-
-For complaint questions, additionally return:
-
-cmr.complaint_type
-cmr.complaint_status
-cmr.complaint_caption
-
-For notice questions, additionally return:
-
-nmr.notice_status
-nmr.pending_tax
-nmr.notice_by
-
-For reporting questions, additionally return:
-
-rmr.report_type
-rmr.report_caption
-rmr.bill_collector_name
-
-For collector questions, return relevant collector details
-such as:
-
-collector_name
-mobile_no
-zone
-total_tax_collection
-total_tax_pending
-today_tax_recovered
-today_reporting
-total_complaint
-total_notice
-login_time
-logout_time
-
-For count questions, use COUNT(*).
-
-For total collection questions, use SUM(paid_amount)
-or the appropriate collection column.
-
-For average questions, use AVG().
-
-For highest questions, use ORDER BY column DESC.
-
-For lowest questions, use ORDER BY column ASC.
-
-Use COALESCE() for NULL values in numeric calculations.
-
-========================================================
-21. POSTGRESQL SQL GENERATION RULES
-========================================================
-
-These rules are mandatory.
-
-1. Generate PostgreSQL-compatible SQL only.
-
-2. Use lowercase table names.
-
-3. Use lowercase snake_case column names.
-
-4. Never use TOP.
-   Use LIMIT instead.
-
-5. Never use WITH (NOLOCK).
-
-6. Never use SQL Server-specific functions.
-
-7. Never use:
-   GETDATE()
-   YEAR()
-   DATEADD()
-   TRY_CONVERT()
-   LEN()
-   LTRIM()
-   RTRIM()
-   ISNULL()
-
-8. Use:
-   EXTRACT(YEAR FROM date_column)
-   LENGTH()
-   TRIM()
-   COALESCE()
-
-9. Use ILIKE for case-insensitive text matching.
-
-10. Use LIMIT 500 as the default result limit.
-
-11. If the user specifies a number, respect that number.
-
-12. Do not add LIMIT to count-only queries unless needed.
-
-13. Use correct PostgreSQL JOIN syntax.
-
-14. Use the actual six migrated PostgreSQL tables.
-
-15. Do not invent table names or column names.
-
-16. Do not generate INSERT.
-
-17. Do not generate UPDATE.
-
-18. Do not generate DELETE.
-
-19. Do not generate DROP.
-
-20. Do not generate ALTER.
-
-21. Do not generate TRUNCATE.
-
-22. Do not generate CREATE.
-
-23. Do not generate EXEC.
-
-24. Do not generate MERGE.
-
-25. Generate SELECT queries only.
-
-26. Do not generate multiple SQL statements.
-
-27. Do not include explanations or Markdown.
-
-28. Return only executable SQL.
-
-29. Do not wrap the SQL in Markdown code fences.
-
-30. Never use SQL Server table aliases or column names
-    with the original capitalization.
-
-========================================================
-22. ROMAN MARATHI MAPPINGS
-========================================================
-
-jyni = who
-kele = paid / done
-bharle = paid amount
-madhe = in
-pexya jast = greater than
-magchya varshi = previous year
-ya varshi = current year
-baki = pending
-kar bharla = tax paid
-dakhva = show
-sankhya = count
-kadhich nahi = never
-saglyat jast = highest
-saglyat kami = lowest
-
-Examples:
-
-"commercial property dakhva"
-=> Show commercial properties.
-
-"jyni magchya varshi kar bharla"
-=> Owners who paid tax in 2025.
-
-"50000 pexya jast baki"
-=> Properties with outstanding arrears greater than 50000.
-
-"cash madhe payment kele"
-=> Cash payments.
-
-"login nahi kele"
-=> Collectors who have not logged in.
-
-========================================================
-23. FINAL SQL VALIDATION BEFORE RETURNING
-========================================================
-
-Before returning the SQL, verify every item:
-
-- Is it valid PostgreSQL syntax?
-- Are all table names correct?
-- Are all column names correct?
-- Are all table names lowercase?
-- Are all column names lowercase snake_case?
-- Is TOP absent?
-- Is WITH (NOLOCK) absent?
-- Are all SQL Server functions removed?
-- Are joins using the correct relationships?
-- Are the correct payment modes used?
-- Are fixed years 2025 and 2026 respected?
-- Is the requested limit respected?
-- Is it a SELECT-only query?
-- Is there only one SQL statement?
-
-If any rule is violated, correct the SQL before returning it.
-
-========================================================
-USER QUESTION
-========================================================
-
-{question}
-
-Generate the PostgreSQL SQL query now.
-
-Return SQL only.
-"""
-
-    response = model.generate_content(prompt)
-
-    sql = response.text.strip()
-
-    # Remove Markdown code fences if Gemini returns them
-    sql = re.sub(r"^```(?:sql)?\s*", "", sql, flags=re.IGNORECASE)
-    sql = re.sub(r"\s*```$", "", sql)
-
-    return sql.strip()
-
-
-# =====================================================
-# SQL VALIDATION
-# =====================================================
-
-def validate_sql(sql):
-
-    sql = sql.strip()
-
-    sql_upper = sql.upper()
-
-    # Allow SELECT queries and SELECT-based CTEs
-    if not (
-        sql_upper.startswith("SELECT")
-        or sql_upper.startswith("WITH")
-    ):
-        return False
-
-    blocked = [
-        "INSERT",
-        "UPDATE",
-        "DELETE",
-        "DROP",
-        "ALTER",
-        "TRUNCATE",
-        "EXEC",
-        "MERGE",
-        "CREATE",
-        "GRANT",
-        "REVOKE"
-    ]
-
-    for keyword in blocked:
-
-        if re.search(
-            rf"\b{keyword}\b",
-            sql_upper
-        ):
+from flask import (Flask, Response, g, jsonify, redirect, render_template,
+                   request, session, url_for)
+
+from werkzeug.security import check_password_hash, generate_password_hash
+
+from connection import get_db_connection
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("SMS_SECRET_KEY", "change-this-secret-key")
+
+IST = timezone(timedelta(hours=5, minutes=30))
+LEAVE_TYPES = {"Sick Leave", "Casual Leave"}
+
+# Email Settings - Auto-clean any accidental spaces
+SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com").strip()
+SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
+SMTP_USER = os.environ.get("SMTP_USER", "").strip()
+SMTP_PASS = os.environ.get("SMTP_PASS", "").replace(" ", "").strip()  # Remove ALL spaces
+
+# ---------------------------------------------------------------- helpers
+def now_ist():
+    return datetime.now(IST).replace(tzinfo=None)
+
+def get_conn():
+    """One database connection per request, reused by every query in it."""
+    if "db" not in g:
+        g.db = get_db_connection()
+    return g.db
+
+@app.teardown_appcontext
+def close_db(exc):
+    conn = g.pop("db", None)
+    if conn is not None:
+        conn.close()
+
+def run(sql, params=(), fetch=None):
+    conn = get_conn()
+    if conn is None:
+        raise RuntimeError("Database is unavailable. Please try again later.")
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        if fetch == "one":
+            return cur.fetchone()
+        if fetch == "all":
+            return cur.fetchall()
+        conn.commit()
+        return cur.rowcount
+    except Exception:
+        conn.rollback()
+        raise
+
+def run_insert(sql, params=()):
+    conn = get_db_connection()
+    if conn is None:
+        raise RuntimeError("Database is unavailable. Please try again later.")
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        new_id = cur.fetchone()[0]
+        conn.commit()
+        return new_id
+    finally:
+        conn.close()
+
+def fmt_time(dt):
+    return dt.strftime("%I:%M:%S %p").lower() if dt else "--:--:--"
+
+def fmt_duration(start, end):
+    if not start or not end:
+        return "00:00:00"
+    secs = max(int((end - start).total_seconds()), 0)
+    return f"{secs // 3600:02d}:{secs % 3600 // 60:02d}:{secs % 60:02d}"
+
+def login_required(role):
+    def deco(fn):
+        @wraps(fn)
+        def wrapper(*a, **kw):
+            if session.get("role") != role:
+                if request.path.startswith("/api/"):
+                    return jsonify(success=False, message="Please sign in again."), 401
+                return redirect(url_for("login_page"))
+            return fn(*a, **kw)
+        return wrapper
+    return deco
+
+def student(fn):
+    return login_required("Student")(fn)
+
+def admin(fn):
+    return login_required("Admin")(fn)
+
+@app.errorhandler(psycopg2.Error)
+@app.errorhandler(RuntimeError)
+def db_error(e):
+    app.logger.error("DB error: %s", e)
+    msg = "Database error. Please try again later."
+    if request.path.startswith("/api/"):
+        return jsonify(success=False, message=msg), 500
+    return msg, 500
+
+def today_attendance(student_id):
+    return run(
+        "SELECT attendance_id, clock_in_time, clock_out_time FROM Attendance "
+        "WHERE student_id=%s AND CAST(clock_in_time AS DATE)=%s "
+        "ORDER BY clock_in_time DESC LIMIT 1",
+        (student_id, now_ist().date()), "one")
+
+_schedule_table_ready = False
+
+def ensure_attendance_schedule_table():
+    global _schedule_table_ready
+    if _schedule_table_ready:
+        return
+    run("""
+        CREATE TABLE IF NOT EXISTS StudentAttendanceSchedule (
+            student_id INT NOT NULL PRIMARY KEY,
+            start_time TIME(0) NOT NULL,
+            end_time TIME(0) NOT NULL,
+            CONSTRAINT fk_studentattendanceschedule_student
+                FOREIGN KEY (student_id) REFERENCES Student(student_id)
+                ON DELETE CASCADE
+        )
+    """)
+    _schedule_table_ready = True
+
+def active_attendance_for_day(day):
+    rows = run("""
+        SELECT s.student_id, s.firstname || ' ' || s.lastname AS name, a.clock_in_time
+        FROM Attendance a
+        JOIN Student s ON s.student_id=a.student_id
+        WHERE CAST(a.clock_in_time AS DATE)=%s AND a.clock_out_time IS NULL
+        ORDER BY a.clock_in_time
+    """, (day,), "all")
+    return [{
+        "id": row.student_id,
+        "name": row.name,
+        "clockIn": fmt_time(row.clock_in_time),
+    } for row in rows]
+
+
+def send_student_credentials(student_email, firstname, password):
+    """Sends login credentials to the newly created student."""
+    try:
+        app.logger.info(f"=== EMAIL START: Sending to {student_email} ===")
+        app.logger.info(f"SMTP_SERVER: {SMTP_SERVER}")
+        app.logger.info(f"SMTP_USER: {SMTP_USER}")
+        app.logger.info(f"SMTP_PASS length: {len(SMTP_PASS)} characters")
+        
+        if not SMTP_USER or not SMTP_PASS:
+            app.logger.error("ERROR: SMTP credentials are empty!")
             return False
 
-    # Reject multiple SQL statements
-    cleaned_sql = sql.rstrip(";").strip()
+        # Create email message
+        msg = MIMEText(f"""Hello {firstname},
 
-    if ";" in cleaned_sql:
+Your account has been successfully created on the Campus Portal.
+
+Username (Email): {student_email}
+Password: {password}
+
+Please log in and change your password immediately.
+
+Regards,
+Campus Portal Administration
+""")
+        msg['Subject'] = "Welcome to Campus Portal - Login Details"
+        msg['From'] = SMTP_USER
+        msg['To'] = student_email
+
+        # --- CHANGED: Use SMTP_SSL on Port 465 (More reliable on Render) ---
+        app.logger.info("Connecting to Gmail via SSL on Port 465...")
+        server = smtplib.SMTP_SSL(SMTP_SERVER, 465, timeout=15)
+        
+        app.logger.info("Logging in to Gmail...")
+        server.login(SMTP_USER, SMTP_PASS)
+        
+        app.logger.info("Sending email...")
+        server.send_message(msg)
+        server.quit()
+        
+        app.logger.info(f"=== EMAIL SUCCESS: Sent to {student_email} ===")
+        return True
+        
+    except smtplib.SMTPAuthenticationError:
+        app.logger.error("GMAIL AUTH FAILED: Check SMTP_PASS")
         return False
-
-    return True
-
-
-# =====================================================
-# EXECUTE SQL
-# =====================================================
-
-
-# =====================================================
-# EXECUTE SQL - NEON POSTGRESQL
-# =====================================================
-
-def execute_sql(sql):
-
-    conn = None
-
-    try:
-
-        if not validate_sql(sql):
-            return {
-                "success": False,
-                "error": "Unsafe SQL detected"
-            }
-
-        # Connect to Neon PostgreSQL
-        conn = get_connection()
-
-        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-
-            cursor.execute(sql)
-
-            rows = cursor.fetchall()
-
-            # Convert PostgreSQL rows into normal dictionaries
-            data = [dict(row) for row in rows]
-
-        df = pd.DataFrame(data)
-
-        # Format date columns
-        for col in df.columns:
-
-            col_lower = str(col).lower()
-
-            if "date" in col_lower:
-
-                try:
-                    df[col] = pd.to_datetime(
-                        df[col],
-                        errors="coerce"
-                    ).dt.strftime("%d-%m-%Y")
-
-                except Exception:
-                    pass
-
-        # Replace missing values
-        df = df.astype(object).where(pd.notna(df), "")
-
-        # Convert to JSON-compatible Python records
-        rows = json.loads(
-            df.to_json(
-                orient="records",
-                force_ascii=False
-            )
-        )
-
-        return {
-            "success": True,
-            "count": len(rows),
-            "rows": rows
-        }
-
     except Exception as e:
-
-        if conn:
-            conn.rollback()
-
-        return {
-            "success": False,
-            "error": str(e),
-            "sql": sql
-        }
-
-    finally:
-
-        if conn:
-            conn.close()
-
-
-# =====================================================
-# HOME PAGE
-# =====================================================
-
-
-@app.get("/", response_class=HTMLResponse)
-async def home(request: Request):
-
-    return templates.TemplateResponse(
-        request=request,
-        name="index.html",
-        context={}
-    )
-# =====================================================
-# HEALTH
-# =====================================================
-
-@app.get("/health")
+        app.logger.error(f"EMAIL FAILED: {str(e)}")
+        return False
+    
+# ---------------------------------------------------------------- health check
+@app.route("/health")
 def health():
+    return "ok"
 
-    return {
-        "status": "running"
-    }
+# ---------------------------------------------------------------- auth
+@app.route("/")
+def login_page():
+    role = session.get("role")
+    if role == "Admin":
+        return redirect(url_for("dashboard_admin"))
+    if role == "Student":
+        return redirect(url_for("dashboard_student"))
+    return render_template("login.html")
 
-# =====================================================
-# SCHEMA
-# =====================================================
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    if not username or not password:
+        return jsonify(success=False, message="Username and password are required.")
+    row = run(
+        "SELECT u.user_id, u.role, u.username, u.password_hash, s.student_id, s.firstname "
+        "FROM users u LEFT JOIN Student s ON s.user_id = u.user_id "
+        "WHERE u.username=%s", (username,), "one")
+    ok, upgrade = verify_pw(row.password_hash, password) if row else (False, False)
+    if not ok:
+        return jsonify(success=False, message="Invalid username or password.")
+    if upgrade:
+        run("UPDATE users SET password_hash=%s WHERE user_id=%s", (hash_pw(password), row.user_id))
+    session.clear()
+    session.update(user_id=row.user_id, role=row.role, username=row.username,
+                   student_id=row.student_id, name=row.firstname or row.username)
+    return jsonify(success=True, role=row.role)
 
-@app.get("/schema")
-def schema():
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login_page"))
 
-    return {
+# ---------------------------------------------------------------- student pages
+@app.route("/dashboard_student")
+@student
+def dashboard_student():
+    sid = session["student_id"]
+    today_date = now_ist().date()
 
-        "database": "TaxDB",
+    # --- HOLIDAY CHECK LOGIC ---
+    is_sunday = today_date.weekday() == 6
+    today_holiday = run("SELECT name FROM Holiday WHERE holiday_date = %s", (today_date,), "one")
+    
+    is_holiday = is_sunday or (today_holiday is not None)
+    
+    if is_sunday:
+        holiday_name = "Sunday (Weekly Off)"
+    elif today_holiday:
+        holiday_name = today_holiday.name
+    else:
+        holiday_name = None
+    # ---------------------------
 
-        "table": "Property_Management_Report",
+    counts = {r.status: r.n for r in run(
+        "SELECT status, COUNT(*) AS n FROM Task WHERE student_id=%s GROUP BY status",
+        (sid,), "all")}
+    completed = counts.get("completed", 0)
+    remaining = counts.get("pending", 0) + counts.get("in_progress", 0) + counts.get("pending_approval", 0)
 
-        "columns": [
+    overdue_row = run("SELECT COUNT(*) AS n FROM Task WHERE student_id=%s AND status NOT IN ('completed', 'pending_approval') AND due_date < %s",
+                      (sid, today_date), "one")
+    overdue = overdue_row.n if overdue_row else 0
 
-            "Sr_No",
-            "Prop_No",
-            "Name_Of_Owner",
-            "Property_Address",
-            "Mobile_No",
-            "Usage",
-            "NRV",
-            "Outstanding_Arrears",
-            "Current_Outstanding",
-            "Penalty_as_on_Month",
-            "Total"
+    lv = run("SELECT COUNT(*) AS total, "
+             "SUM(CASE WHEN status='Pending' THEN 1 ELSE 0 END) AS pending "
+             "FROM LeaveRequest WHERE student_id=%s", (sid,), "one")
 
-        ]
-    }
+    att = today_attendance(sid)
+    if not att:
+        att_status, att_sub, cin, cout, dur = "Not Started", "No clock-in yet", "--:--:--", "--:--:--", "00:00:00"
+    elif att.clock_out_time is None:
+        att_status = "In Progress"
+        att_sub = f"Started at {fmt_time(att.clock_in_time)}"
+        cin, cout, dur = fmt_time(att.clock_in_time), "--:--:--", "00:00:00"
+    else:
+        att_status = "Completed"
+        att_sub = f"Worked {fmt_duration(att.clock_in_time, att.clock_out_time)}"
+        cin, cout = fmt_time(att.clock_in_time), fmt_time(att.clock_out_time)
+        dur = fmt_duration(att.clock_in_time, att.clock_out_time)
 
-# # =====================================================
-# # ASK AI
-# # =====================================================
+    start_of_week = today_date - timedelta(days=today_date.weekday())
+    end_of_week = start_of_week + timedelta(days=6)
 
-@app.post("/generate-sql")
-def generate_sql_api(request: QuestionRequest):
+    week_att = run(
+        "SELECT clock_in_time, clock_out_time FROM Attendance WHERE student_id=%s AND CAST(clock_in_time AS DATE) BETWEEN %s AND %s",
+        (sid, start_of_week, end_of_week), "all"
+    )
+
+    weekly_totals = [0] * 7
+    total_week_secs = 0
+    for r in week_att:
+        if r.clock_in_time and r.clock_out_time:
+            day_idx = r.clock_in_time.weekday()
+            secs = (r.clock_out_time - r.clock_in_time).total_seconds()
+            weekly_totals[day_idx] += secs
+            total_week_secs += secs
+
+    week_h = int(total_week_secs // 3600)
+    week_m = int((total_week_secs % 3600) // 60)
+    week_duration_str = f"{week_h}h {week_m:02d}m"
+    week_progress_pct = min(100, int((total_week_secs / 144000) * 100))
+
+    month_start = today_date.replace(day=1)
+    present_days = run("SELECT COUNT(DISTINCT CAST(clock_in_time AS DATE)) AS n FROM Attendance WHERE student_id=%s AND CAST(clock_in_time AS DATE) >= %s", (sid, month_start), "one").n
+    holidays = run("SELECT name, holiday_date FROM Holiday WHERE holiday_date>=%s ORDER BY holiday_date LIMIT 3", (today_date,), "all")
+    recent = run("SELECT title, due_date, status FROM Task WHERE student_id=%s ORDER BY created_at DESC LIMIT 5", (sid,), "all")
+
+    # --- UPCOMING BIRTHDAYS (NEXT 2 MONTHS) ---
+    students_with_dob = run("SELECT firstname, lastname, dob FROM Student WHERE dob IS NOT NULL", fetch="all")
+    upcoming_birthdays = []
+    target_date = today_date + timedelta(days=60) # Look ahead 60 days (approx 2 months)
+
+    for s in students_with_dob:
+        try:
+            # Set birthday to current year
+            bday = s.dob.replace(year=today_date.year)
+        except ValueError:
+            # Handle Feb 29 on non-leap years
+            bday = s.dob.replace(year=today_date.year, day=28)
+
+        # If birthday already passed this year, check next year
+        if bday < today_date:
+            try:
+                bday = s.dob.replace(year=today_date.year + 1)
+            except ValueError:
+                bday = s.dob.replace(year=today_date.year + 1, day=28)
+
+        # If birthday is within the next 60 days
+        if today_date <= bday <= target_date:
+            upcoming_birthdays.append({
+                "name": f"{s.firstname} {s.lastname}",
+                "date": bday
+            })
+
+    # Sort by date and keep top 5
+    upcoming_birthdays.sort(key=lambda x: x["date"])
+    upcoming_birthdays = upcoming_birthdays[:5]
+    # ------------------------------------------
+
+    # --- TODAY'S ON LEAVES ---
+    today_leaves = run("""
+        SELECT s.firstname || ' ' || s.lastname AS name, l.leave_type, l.start_date, l.end_date
+        FROM LeaveRequest l
+        JOIN Student s ON s.student_id = l.student_id
+        WHERE l.status = 'Approved' AND %s BETWEEN l.start_date AND l.end_date
+        ORDER BY s.firstname
+    """, (today_date,), "all")
+    today_leaves_list = [{"name": t.name, "type": t.leave_type} for t in today_leaves]
+    # --------------------------------
+
+    return render_template(
+        "dashboard_student.html", username=session["name"], student_id=sid,
+        remaining_tasks=remaining, completed_tasks=completed, overdue_tasks=overdue,
+        total_leaves=lv.total or 0, pending_leaves=lv.pending or 0,
+        att_status=att_status, att_sub=att_sub, clock_in=cin, clock_out=cout,
+        duration=dur, upcoming_holidays=holidays, recent_tasks=recent,
+        present_days=present_days,
+        weekly_totals=weekly_totals, week_duration_str=week_duration_str,
+        week_progress_pct=week_progress_pct, today_weekday=today_date.weekday(),
+        today_date=today_date,
+        is_holiday=is_holiday, holiday_name=holiday_name,
+        upcoming_birthdays=upcoming_birthdays,
+        today_leaves=today_leaves_list
+    )
+
+@app.route("/calendar")
+@student
+def calendar_page():
+    rows = run("SELECT holiday_date, name FROM Holiday", fetch="all")
+    return render_template("calendar.html",
+                           holidays={r.holiday_date.isoformat(): r.name for r in rows})
+
+@app.route("/leave")
+@student
+def leave_page():
+    leaves = run("SELECT leave_type, start_date, end_date, status FROM LeaveRequest "
+                 "WHERE student_id=%s ORDER BY applied_on DESC", (session["student_id"],), "all")
+    return render_template(
+        "leave.html", leaves=leaves, total=len(leaves),
+        pending=sum(1 for l in leaves if l.status == "Pending"),
+        approved=sum(1 for l in leaves if l.status == "Approved"))
+
+@app.route("/tasks")
+@student
+def tasks_page():
+    return render_template("tasks.html")
+
+def attendance_records(sid):
+    rows = run("SELECT clock_in_time, clock_out_time, clock_in_lat, clock_in_lng, clock_out_lat, clock_out_lng FROM Attendance WHERE student_id=%s "
+               "ORDER BY clock_in_time DESC", (sid,), "all")
+    return [{"date": r.clock_in_time, "clock_in_time": r.clock_in_time,
+             "clock_out_time": r.clock_out_time,
+             "working_hours": fmt_duration(r.clock_in_time, r.clock_out_time),
+             "in_lat": float(r.clock_in_lat) if r.clock_in_lat else None,
+             "in_lng": float(r.clock_in_lng) if r.clock_in_lng else None,
+             "out_lat": float(r.clock_out_lat) if r.clock_out_lat else None,
+             "out_lng": float(r.clock_out_lng) if r.clock_out_lng else None} for r in rows]
+
+@app.route("/attendance")
+@student
+def attendance_page():
+    records = attendance_records(session["student_id"])
+    total_secs = sum((r["clock_out_time"] - r["clock_in_time"]).total_seconds()
+                     for r in records if r["clock_out_time"])
+    today = now_ist().date()
+    today_rec = next((r for r in records if r["date"].date() == today), None)
+    return render_template(
+        "attendance.html", records=records,
+        days_recorded=len({r["date"].date() for r in records}),
+        total_hours=f"{int(total_secs // 3600)}h {int(total_secs % 3600 // 60)}m",
+        today_duration=today_rec["working_hours"] if today_rec else "00:00:00")
+
+@app.route("/attendance/export")
+@student
+def attendance_export():
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(["Date", "Clock In (IST)", "Clock Out (IST)", "Duration"])
+    for r in attendance_records(session["student_id"]):
+        w.writerow([r["date"].strftime("%Y-%m-%d"), fmt_time(r["clock_in_time"]),
+                    fmt_time(r["clock_out_time"]), r["working_hours"]])
+    return Response(out.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=attendance.csv"})
+
+@app.route("/student_profile")
+@student
+def student_profile():
+    student = run("""
+        SELECT s.student_id, s.firstname, s.lastname, s.email, s.mobile_no,
+               s.gender, s.dob, s.city, u.username
+        FROM Student s
+        INNER JOIN users u ON s.user_id = u.user_id
+        WHERE s.student_id = %s
+    """, (session["student_id"],), "one")
+
+    if not student:
+        return "Profile not found", 404
+
+    p = compute_performance(session["student_id"])
+
+    return render_template("student_profile.html",
+                           student=student, p=p, username=session["name"])
+
+# ---------------------------------------------------------------- student APIs
+@app.route("/api/clock_in", methods=["POST"])
+@student
+def api_clock_in():
+    sid = session["student_id"]
+    today = now_ist().date()
+    
+    # 1. Block Sundays automatically
+    if today.weekday() == 6: 
+        return jsonify(success=False, message="Today is Sunday. Clock-in is disabled.")
+    
+    # 2. Block specific database holidays
+    today_holiday = run("SELECT name FROM Holiday WHERE holiday_date = %s", (today,), "one")
+    if today_holiday:
+        return jsonify(success=False, message=f"Today is a holiday ({today_holiday.name}). Clock-in is disabled.")
+    
+    if today_attendance(sid):
+        return jsonify(success=False, message="You have already clocked in today.")
+    
+    # GET LOCATION DATA FROM FRONTEND
+    data = request.get_json(silent=True) or {}
+    lat = data.get("lat")
+    lng = data.get("lng")
+    
+    now = now_ist()
+    ensure_attendance_schedule_table()
+    schedule = run(
+        "SELECT start_time FROM StudentAttendanceSchedule WHERE student_id=%s",
+        (sid,), "one")
+    if schedule and now.time() < schedule.start_time:
+        return jsonify(
+            success=False,
+            message=f"Clock-in opens at {schedule.start_time.strftime('%I:%M %p').lower()}.")
+    
+    # SAVE LOCATION TO DATABASE
+    run("""
+        INSERT INTO Attendance (student_id, clock_in_time, clock_in_lat, clock_in_lng) 
+        VALUES (%s, %s, %s, %s)
+    """, (sid, now, lat, lng))
+    
+    return jsonify(success=True, time=fmt_time(now))
+
+@app.route("/api/clock_out", methods=["POST"])
+@student
+def api_clock_out():
+    sid = session["student_id"]
+    att = today_attendance(sid)
+    if not att:
+        return jsonify(success=False, message="Clock in first.")
+    if att.clock_out_time:
+        return jsonify(success=False, message="You have already clocked out today.")
+    
+    # GET LOCATION DATA FROM FRONTEND
+    data = request.get_json(silent=True) or {}
+    lat = data.get("lat")
+    lng = data.get("lng")
+    
+    now = now_ist()
+    
+    # SAVE LOCATION TO DATABASE
+    run("""
+        UPDATE Attendance 
+        SET clock_out_time=%s, clock_out_lat=%s, clock_out_lng=%s 
+        WHERE attendance_id=%s
+    """, (now, lat, lng, att.attendance_id))
+    
+    return jsonify(success=True, time=fmt_time(now),
+                   duration=fmt_duration(att.clock_in_time, now))
+
+@app.route("/api/attendance_status", methods=["GET"])
+@student
+def api_attendance_status():
+    att = today_attendance(session["student_id"])
+    if not att:
+        return jsonify(status="Not Started", clock_in="--:--:--", duration="00:00:00")
+    if not att.clock_out_time:
+        return jsonify(status="In Progress", clock_in=fmt_time(att.clock_in_time), duration="00:00:00")
+    return jsonify(
+        status="Completed",
+        clock_in=fmt_time(att.clock_in_time),
+        duration=fmt_duration(att.clock_in_time, att.clock_out_time)
+    )
+
+@app.route("/api/update_profile", methods=["POST"])
+@student
+def api_update_profile():
+    d = request.get_json(silent=True) or {}
+    sid = session["student_id"]
+
+    firstname = (d.get("firstname") or "").strip()
+    lastname = (d.get("lastname") or "").strip()
+    email = (d.get("email") or "").strip()
+    mobile_no = (d.get("mobile_no") or "").strip()
+    gender = (d.get("gender") or "").strip()
+    dob_str = (d.get("dob") or "").strip()
+    city = (d.get("city") or "").strip()
+
+    if not firstname or not lastname or not email or not city:
+        return jsonify(success=False, message="Name, email, and city are required."), 400
+
+    if "@" not in email:
+        return jsonify(success=False, message="Invalid email address."), 400
 
     try:
-
-        sql = generate_sql(request.question)
-
-        return {
-            "success": True,
-            "question": request.question,
-            "generated_sql": sql
-        }
-
-    except Exception as e:
-
-        print("GENERATE SQL ERROR:", str(e))
-
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-# =====================================================
-# EXECUTE QUERY
-# =====================================================
-
-@app.post("/execute")
-def execute_api(request: QuestionRequest):
+        dob = date.fromisoformat(dob_str) if dob_str else None
+    except ValueError:
+        return jsonify(success=False, message="Invalid date of birth."), 400
 
     try:
+        existing = run("SELECT student_id FROM Student WHERE email=%s AND student_id<>%s", (email, sid), "one")
+        if existing:
+            return jsonify(success=False, message="That email address is already in use by another account."), 400
 
-        sql = generate_sql(request.question)
+        run("""
+            UPDATE Student
+            SET firstname=%s, lastname=%s, email=%s, mobile_no=%s, gender=%s, dob=%s, city=%s
+            WHERE student_id=%s
+        """, (firstname, lastname, email, mobile_no or None, gender or None, dob, city, sid))
 
-        result = execute_sql(sql)
+        run("UPDATE users SET username=%s WHERE user_id=(SELECT user_id FROM Student WHERE student_id=%s)", (email, sid))
 
-        return {
-            "success": result.get("success", False),
-            "question": request.question,
-            "generated_sql": sql,
-            "result": result
+        session["name"] = firstname
+        return jsonify(success=True)
+    except psycopg2.IntegrityError:
+        return jsonify(success=False, message="Database error updating profile."), 400
+
+@app.route("/api/add_leave", methods=["POST"])
+@student
+def api_add_leave():
+    d = request.get_json(silent=True) or {}
+    if d.get("leave_type") not in LEAVE_TYPES:
+        return jsonify(success=False, message="Choose a valid leave type."), 400
+    try:
+        start = date.fromisoformat(d.get("start_date", ""))
+        end = date.fromisoformat(d.get("end_date", ""))
+    except ValueError:
+        return jsonify(success=False, message="Enter valid dates."), 400
+    if end < start:
+        return jsonify(success=False, message="End date cannot be before start date."), 400
+    if start < now_ist().date():
+        return jsonify(success=False, message="Start date cannot be in the past."), 400
+    run("INSERT INTO LeaveRequest (student_id, start_date, end_date, leave_type, reason) "
+        "VALUES (%s, %s, %s, %s, %s)",
+        (session["student_id"], start, end, d["leave_type"], (d.get("reason") or "").strip()))
+    return jsonify(success=True)
+
+# ================================================================ TASKS API
+@app.route("/api/students", methods=["GET"])
+@student
+def api_students_list():
+    rows = run(
+        "SELECT firstname || ' ' || lastname AS name FROM Student ORDER BY firstname, lastname",
+        fetch="all")
+    return jsonify([{"name": r.name} for r in rows])
+
+@app.route("/api/tasks", methods=["GET"])
+@student
+def api_tasks_list():
+    sid = session["student_id"]
+    rows = run("""
+        SELECT task_id, title, status, due_date, created_at, updated_at,
+               assigned_to, estimated_hours, hours_logged
+        FROM Task WHERE student_id=%s ORDER BY created_at DESC
+    """, (sid,), "all")
+
+    result = []
+    for r in rows:
+        result.append({
+            "id": r.task_id,
+            "code": f"TASK-{r.task_id:03d}",
+            "title": r.title,
+            "status": r.status,
+            "due": r.due_date.isoformat() if r.due_date else "",
+            "start": r.created_at.strftime("%Y-%m-%d") if r.created_at else "",
+            "completedOn": r.updated_at.strftime("%Y-%m-%d") if r.status == 'completed' and r.updated_at else "",
+            "assignee": r.assigned_to or "",
+            "estimate": float(r.estimated_hours) if r.estimated_hours else 0,
+            "hoursLogged": float(r.hours_logged) if r.hours_logged else 0
+        })
+    return jsonify(result)
+
+@app.route("/api/tasks", methods=["POST"])
+@student
+def api_tasks_create():
+    d = request.get_json(silent=True) or {}
+    title = (d.get("title") or "").strip()
+    if not title:
+        return jsonify(success=False, message="Task title is required."), 400
+
+    sid = session["student_id"]
+    run("""
+        INSERT INTO Task (student_id, title, due_date, status, assigned_to)
+        VALUES (%s, %s, %s, 'pending', %s)
+    """, (
+        sid,
+        title,
+        d.get("due") or now_ist().date(),
+        d.get("assignee")
+    ))
+    return jsonify(success=True)
+
+@app.route("/api/tasks/<int:tid>", methods=["PUT"])
+@student
+def api_tasks_update(tid):
+    d = request.get_json(silent=True) or {}
+    sid = session["student_id"]
+
+    n = run("""
+        UPDATE Task
+        SET title=%s, due_date=%s, assigned_to=%s
+        WHERE task_id=%s AND student_id=%s
+    """, (
+        d.get("title"), d.get("due"), d.get("assignee"), tid, sid
+    ))
+
+    if not n:
+        return jsonify(success=False, message="Task not found."), 404
+    return jsonify(success=True)
+
+@app.route("/api/tasks/<int:tid>/log_time", methods=["POST"])
+@student
+def api_tasks_log_time(tid):
+    d = request.get_json(silent=True) or {}
+    hours = float(d.get("hours", 0))
+    if hours <= 0:
+        return jsonify(success=False, message="Invalid hours."), 400
+
+    n = run("""
+        UPDATE Task
+        SET hours_logged = COALESCE(hours_logged, 0) + %s,
+            status = 'pending_approval',
+            updated_at = %s
+        WHERE task_id=%s AND student_id=%s
+    """, (hours, now_ist(), tid, session["student_id"]))
+
+    if not n:
+        return jsonify(success=False, message="Task not found."), 404
+    return jsonify(success=True)
+
+# ---------------------------------------------------------------- admin
+@app.route("/dashboard_admin")
+@admin
+def dashboard_admin():
+    return render_template("dashboard_admin.html")
+
+@app.route("/api/admin/summary")
+@admin
+def admin_summary():
+    today = now_ist().date()
+    r = run("SELECT "
+            "(SELECT COUNT(*) FROM Student) AS students, "
+            "(SELECT COUNT(DISTINCT student_id) FROM Attendance "
+            " WHERE CAST(clock_in_time AS DATE)=%s) AS present, "
+            "(SELECT COUNT(*) FROM LeaveRequest WHERE status='Pending') AS leaves, "
+            "(SELECT COUNT(*) FROM Task WHERE status NOT IN ('completed', 'pending_approval')) AS tasks",
+            (today,), "one")
+    return jsonify(students=r.students, present=r.present, leaves=r.leaves,
+                   tasks=r.tasks, activeStudents=active_attendance_for_day(today))
+
+@app.route("/api/admin/active-attendance")
+@admin
+def admin_active_attendance():
+    return jsonify(activeStudents=active_attendance_for_day(now_ist().date()))
+
+@app.route("/api/admin/students")
+@admin
+def admin_students():
+    rows = run("SELECT student_id, firstname || ' ' || lastname AS name FROM Student "
+               "ORDER BY firstname", fetch="all")
+    return jsonify([{"id": r.student_id, "name": r.name} for r in rows])
+
+@app.route("/api/admin/leaves")
+@admin
+def admin_leaves():
+    rows = run("SELECT l.leave_id, s.firstname || ' ' || s.lastname AS name, l.leave_type, "
+               "l.start_date, l.end_date, l.reason, l.status FROM LeaveRequest l "
+               "JOIN Student s ON s.student_id=l.student_id ORDER BY l.applied_on DESC",
+               fetch="all")
+    return jsonify([{"id": r.leave_id, "student": r.name, "type": r.leave_type,
+                     "start": r.start_date.isoformat(), "end": r.end_date.isoformat(),
+                     "reason": r.reason or "", "status": r.status} for r in rows])
+
+@app.route("/api/admin/leaves/<int:leave_id>", methods=["POST"])
+@admin
+def admin_decide_leave(leave_id):
+    status = (request.get_json(silent=True) or {}).get("status")
+    if status not in ("Approved", "Rejected"):
+        return jsonify(success=False, message="Invalid status."), 400
+    run("UPDATE LeaveRequest SET status=%s WHERE leave_id=%s", (status, leave_id))
+    return jsonify(success=True)
+
+@app.route("/api/admin/attendance", methods=["GET"])
+@admin
+def admin_attendance():
+    month = request.args.get("month") or now_ist().strftime("%Y-%m")
+    try:
+        y, m = map(int, month.split("-"))
+        days = cal.monthrange(y, m)[1]
+    except ValueError:
+        return jsonify(success=False, message="Invalid month."), 400
+
+    ensure_attendance_schedule_table()
+    start_date, end_date = date(y, m, 1), date(y, m, days)
+    status_rows = run(
+        "SELECT student_id, attendance_date, status FROM AttendanceStatus "
+        "WHERE attendance_date BETWEEN %s AND %s", (start_date, end_date), "all")
+    records = {}
+    for r in status_rows:
+        records.setdefault(str(r.student_id), {})[str(r.attendance_date.day)] = r.status
+    attendance_rows = run("""
+        SELECT a.student_id, a.clock_in_time, a.clock_out_time,
+               a.clock_in_lat, a.clock_in_lng, a.clock_out_lat, a.clock_out_lng,
+               s.start_time, s.end_time
+        FROM Attendance a
+        LEFT JOIN StudentAttendanceSchedule s ON s.student_id=a.student_id
+        WHERE CAST(a.clock_in_time AS DATE) BETWEEN %s AND %s
+        ORDER BY a.clock_in_time DESC
+    """, (start_date, end_date), "all")
+    clock_times = {}
+    for r in attendance_rows:
+        attendance_day = r.clock_in_time.date()
+        student_key = str(r.student_id)
+        day_key = str(attendance_day.day)
+        student_times = clock_times.setdefault(student_key, {})
+        if day_key in student_times:
+            continue
+
+        clock_in = r.clock_in_time.time()
+        if r.end_time and r.clock_out_time and r.clock_out_time.time() < r.end_time:
+            automatic_status = "Half-day"
+        elif r.start_time and clock_in > r.start_time:
+            automatic_status = "Late"
+        else:
+            automatic_status = "Present"
+
+        student_times[day_key] = {
+            "clockIn": fmt_time(r.clock_in_time),
+            "clockOut": fmt_time(r.clock_out_time) if r.clock_out_time else "",
+            "inLat": float(r.clock_in_lat) if r.clock_in_lat else None,
+            "inLng": float(r.clock_in_lng) if r.clock_in_lng else None,
+            "outLat": float(r.clock_out_lat) if r.clock_out_lat else None,
+            "outLng": float(r.clock_out_lng) if r.clock_out_lng else None,
         }
+        records.setdefault(student_key, {}).setdefault(day_key, automatic_status)
 
-    except Exception as e:
+    schedules = run(
+        "SELECT student_id, start_time, end_time FROM StudentAttendanceSchedule",
+        fetch="all")
+    return jsonify(
+        days=days, year=y, month=m, records=records, clockTimes=clock_times,
+        schedules=[{
+            "studentId": r.student_id,
+            "startTime": r.start_time.strftime("%H:%M"),
+            "endTime": r.end_time.strftime("%H:%M"),
+        } for r in schedules])
 
-        print("EXECUTE ERROR:", str(e))
+@app.route("/api/admin/attendance/schedules", methods=["POST"])
+@admin
+def admin_attendance_schedule():
+    d = request.get_json(silent=True) or {}
+    try:
+        sid = int(d.get("student_id"))
+        start_time = dtime.fromisoformat(d.get("start_time", ""))
+        end_time = dtime.fromisoformat(d.get("end_time", ""))
+    except (ValueError, TypeError):
+        return jsonify(success=False, message="Choose a student and valid schedule times."), 400
+    if start_time >= end_time:
+        return jsonify(success=False, message="End time must be after start time."), 400
 
-        return {
-            "success": False,
-            "error": str(e)
-        }
+    ensure_attendance_schedule_table()
+    if not run("SELECT student_id FROM Student WHERE student_id=%s", (sid,), "one"):
+        return jsonify(success=False, message="Student not found."), 404
 
+    updated = run(
+        "UPDATE StudentAttendanceSchedule SET start_time=%s, end_time=%s WHERE student_id=%s",
+        (start_time, end_time, sid))
+    if not updated:
+        run(
+            "INSERT INTO StudentAttendanceSchedule (student_id, start_time, end_time) "
+            "VALUES (%s, %s, %s)", (sid, start_time, end_time))
+    return jsonify(success=True)
 
-# =====================================================
-# ASK AI
-# =====================================================
+@app.route("/api/admin/tasks", methods=["GET", "POST"])
+@admin
+def admin_tasks():
+    if request.method == "POST":
+        d = request.get_json(silent=True) or {}
+        title = (d.get("title") or "").strip()
+        try:
+            due = date.fromisoformat(d.get("due_date", ""))
+            sid = int(d.get("student_id"))
+        except (ValueError, TypeError):
+            return jsonify(success=False, message="Choose a student and a valid due date."), 400
+        if not title or len(title) > 255:
+            return jsonify(success=False, message="Enter a title (max 255 characters)."), 400
+        run("INSERT INTO Task (student_id, title, description, due_date) VALUES (%s, %s, %s, %s)",
+            (sid, title, (d.get("description") or "").strip() or None, due))
+        return jsonify(success=True)
+    rows = run("SELECT t.task_id, t.title, t.due_date, t.status, "
+               "s.firstname || ' ' || s.lastname AS name FROM Task t "
+               "JOIN Student s ON s.student_id=t.student_id ORDER BY t.due_date DESC",
+               fetch="all")
+    return jsonify([{"id": r.task_id, "title": r.title, "student": r.name,
+                     "due": r.due_date.isoformat(), "status": r.status} for r in rows])
 
-@app.post("/ask")
-def ask_ai(request: QuestionRequest):
+@app.route("/api/admin/tasks/<int:tid>/approve", methods=["POST"])
+@admin
+def admin_approve_task(tid):
+    run("UPDATE Task SET status='completed', updated_at=%s WHERE task_id=%s", (now_ist(), tid))
+    return jsonify(success=True)
+
+@app.route("/api/admin/tasks/<int:tid>/reject", methods=["POST"])
+@admin
+def admin_reject_task(tid):
+    run("UPDATE Task SET status='in_progress', updated_at=%s WHERE task_id=%s", (now_ist(), tid))
+    return jsonify(success=True)
+
+@app.route("/api/admin/tasks/<int:task_id>/delete", methods=["POST"])
+@admin
+def admin_delete_task(task_id):
+    run("DELETE FROM Task WHERE task_id=%s", (task_id,))
+    return jsonify(success=True)
+
+@app.route("/api/admin/holidays", methods=["GET", "POST", "DELETE"])
+@admin
+def admin_holidays():
+    if request.method == "GET":
+        rows = run("SELECT holiday_date, name FROM Holiday", fetch="all")
+        return jsonify({r.holiday_date.isoformat(): r.name for r in rows})
+    d = request.get_json(silent=True) or {}
+    try:
+        day = date.fromisoformat(d.get("date", ""))
+    except ValueError:
+        return jsonify(success=False, message="Invalid date."), 400
+    if request.method == "DELETE":
+        run("DELETE FROM Holiday WHERE holiday_date=%s", (day,))
+    else:
+        name = (d.get("name") or "").strip()
+        if not name or len(name) > 100:
+            return jsonify(success=False, message="Enter a holiday name (max 100)."), 400
+        if not run("UPDATE Holiday SET name=%s WHERE holiday_date=%s", (name, day)):
+            run("INSERT INTO Holiday (holiday_date, name) VALUES (%s, %s)", (day, name))
+    return jsonify(success=True)
+
+# ================================================================ SECURITY
+def hash_pw(p):
+    return generate_password_hash(p, method="pbkdf2:sha256")
+
+def verify_pw(stored, p):
+    if isinstance(stored, (bytes, bytearray, memoryview)):
+        stored = bytes(stored).decode("utf-8")
+    if stored.startswith(("pbkdf2:", "scrypt:")):
+        return check_password_hash(stored, p), False
+    ok = hmac.compare_digest(stored.encode("utf-8"), p.encode("utf-8"))
+    return ok, ok
+
+def password_problem(p):
+    if len(p) < 8:
+        return "Password must be at least 8 characters."
+    if len(p) > 128:
+        return "Password is too long (max 128)."
+    return None
+
+def any_user(fn):
+    @wraps(fn)
+    def wrapper(*a, **kw):
+        if not session.get("role"):
+            return jsonify(success=False, message="Please sign in again."), 401
+        return fn(*a, **kw)
+    return wrapper
+
+def run_tx(fn):
+    conn = get_conn()
+    if conn is None:
+        raise RuntimeError("Database is unavailable. Please try again later.")
+    try:
+        result = fn(conn.cursor())
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+
+@app.route("/api/change_password", methods=["POST"])
+@any_user
+def api_change_password():
+    d = request.get_json(silent=True) or {}
+    current = d.get("current_password") or ""
+    new = d.get("new_password") or ""
+    row = run("SELECT password_hash FROM users WHERE user_id=%s", (session["user_id"],), "one")
+    if not row or not verify_pw(row.password_hash, current)[0]:
+        return jsonify(success=False, message="Current password is incorrect."), 400
+    if new != (d.get("confirm_password") or ""):
+        return jsonify(success=False, message="New passwords do not match."), 400
+    if new == current:
+        return jsonify(success=False, message="New password must be different."), 400
+    problem = password_problem(new)
+    if problem:
+        return jsonify(success=False, message=problem), 400
+    run("UPDATE users SET password_hash=%s WHERE user_id=%s", (hash_pw(new), session["user_id"]))
+    return jsonify(success=True)
+
+@app.route("/security")
+@student
+def security_page():
+    return render_template("security.html")
+
+# ================================================================ PERFORMANCE
+def grade_for(score):
+    for cutoff, g_ in ((90, "A"), (75, "B"), (60, "C"), (40, "D")):
+        if score >= cutoff:
+            return g_
+    return "F"
+
+def compute_performance(sid):
+    today = now_ist().date()
+    start = today - timedelta(days=29)
+    logins = run("SELECT clock_in_time FROM Attendance WHERE student_id=%s "
+                 "AND CAST(clock_in_time AS DATE) BETWEEN %s AND %s", (sid, start, today), "all")
+    att_dates = {r.clock_in_time.date() for r in logins}
+    holidays = {h.holiday_date for h in run(
+        "SELECT holiday_date FROM Holiday WHERE holiday_date BETWEEN %s AND %s", (start, today), "all")}
+    leave_rows = run("SELECT start_date, end_date FROM LeaveRequest WHERE student_id=%s "
+                     "AND status='Approved'", (sid,), "all")
+    leave_days = set()
+    for l in leave_rows:
+        d = l.start_date
+        while d <= l.end_date:
+            leave_days.add(d)
+            d += timedelta(days=1)
+
+    expected = []
+    for i in range(30):
+        d = start + timedelta(days=i)
+        if d.weekday() >= 5 or d in holidays or d in leave_days:
+            continue
+        if d == today and d not in att_dates:
+            continue
+        expected.append(d)
+    attended = sum(1 for d in expected if d in att_dates)
+    att_pct = round(attended / len(expected) * 100, 2) if expected else 100.0
+    absent = len(expected) - attended
+
+    counts = {r.status: r.n for r in run(
+        "SELECT status, COUNT(*) AS n FROM Task WHERE student_id=%s GROUP BY status", (sid,), "all")}
+    done = counts.get("completed", 0)
+    total_tasks = sum(counts.values())
+    remaining = total_tasks - done
+    task_pct = round(done / total_tasks * 100, 2) if total_tasks else None
+    overall = att_pct if task_pct is None else round(0.6 * att_pct + 0.4 * task_pct, 2)
+    grade = grade_for(overall)
+
+    avg_login = None
+    if logins:
+        secs = sum(r.clock_in_time.hour * 3600 + r.clock_in_time.minute * 60 + r.clock_in_time.second
+                   for r in logins) // len(logins)
+        avg_login = dtime(secs // 3600, secs % 3600 // 60, secs % 60)
+    total_leaves = len(leave_rows)
+
+    vals = (overall, grade, att_pct, avg_login, done, remaining, total_leaves, absent)
+    n = run("UPDATE Performance SET overall_percentage=%s, grade=%s, total_attendance_percentage=%s, "
+            "avg_login_time=%s, total_tasks_completed=%s, remaining_tasks=%s, total_leaves=%s, "
+            "absent_without_leave=%s WHERE student_id=%s", vals + (sid,))
+    if not n:
+        run("INSERT INTO Performance (overall_percentage, grade, total_attendance_percentage, "
+            "avg_login_time, total_tasks_completed, remaining_tasks, total_leaves, "
+            "absent_without_leave, student_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)", vals + (sid,))
+    return {"overall": overall, "grade": grade, "attendance_pct": att_pct, "task_pct": task_pct,
+            "completed": done, "remaining": remaining, "leaves": total_leaves, "absent": absent,
+            "expected": len(expected), "attended": attended,
+            "avg_login": avg_login.strftime("%I:%M %p").lower() if avg_login else "—"}
+
+@app.route("/performance")
+@student
+def performance_page():
+    return render_template("performance.html", p=compute_performance(session["student_id"]))
+
+# ================================================================ TIMETABLE
+DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+@app.route("/timetable")
+@student
+def timetable_page():
+    rows = run("SELECT timetable_id, day_of_week, time_slots FROM TimeTable "
+               "WHERE student_id=%s ORDER BY time_slots", (session["student_id"],), "all")
+    grouped = [(d, [r for r in rows if r.day_of_week == d]) for d in DAYS]
+    return render_template("timetable.html", grouped=grouped, days=DAYS,
+                           today=now_ist().strftime("%A"))
+
+@app.route("/api/timetable/add", methods=["POST"])
+@student
+def api_timetable_add():
+    d = request.get_json(silent=True) or {}
+    slot = (d.get("time_slots") or "").strip()
+    if d.get("day_of_week") not in DAYS:
+        return jsonify(success=False, message="Choose a valid day."), 400
+    if not slot or len(slot) > 255:
+        return jsonify(success=False, message="Enter a time slot (max 255 characters)."), 400
+    run("INSERT INTO TimeTable (student_id, day_of_week, time_slots) VALUES (%s, %s, %s)",
+        (session["student_id"], d["day_of_week"], slot))
+    return jsonify(success=True)
+
+@app.route("/api/timetable/delete", methods=["POST"])
+@student
+def api_timetable_delete():
+    tid = (request.get_json(silent=True) or {}).get("timetable_id")
+    n = run("DELETE FROM TimeTable WHERE timetable_id=%s AND student_id=%s",
+            (tid, session["student_id"]))
+    if not n:
+        return jsonify(success=False, message="Entry not found."), 404
+    return jsonify(success=True)
+
+# ================================================================ ADMIN: STUDENTS
+def clean_student(d, creating):
+    v = {k: (d.get(k) or "").strip() for k in
+         ("firstname", "lastname", "email", "mobile_no", "gender", "dob", "city")}
+
+    for k, label, mx in (("firstname", "First name", 50), ("lastname", "Last name", 50),
+                         ("city", "City", 50)):
+        if not v[k] or len(v[k]) > mx:
+            return None, f"{label} is required (max {mx} characters)."
+    if "@" not in v["email"] or len(v["email"]) > 100:
+        return None, "Enter a valid email address."
+    if v["mobile_no"] and not (v["mobile_no"].isdigit() and 7 <= len(v["mobile_no"]) <= 15):
+        return None, "Mobile number must be 7-15 digits."
+    if v["gender"] not in ("", "Male", "Female", "Other"):
+        return None, "Invalid gender."
+
+    if v["dob"]:
+        try:
+            v["dob"] = date.fromisoformat(v["dob"])
+        except ValueError:
+            return None, "Invalid date of birth."
+    else:
+        if creating:
+            return None, "Date of birth is required to generate the password."
+        v["dob"] = None
+
+    return v, None
+
+@app.route("/api/admin/student-list")
+@admin
+def admin_student_list():
+    rows = run("SELECT s.student_id, u.username, s.firstname, s.lastname, s.email, s.mobile_no, "
+               "s.gender, s.dob, s.city FROM Student s JOIN users u ON u.user_id=s.user_id "
+               "ORDER BY s.firstname, s.lastname", fetch="all")
+    return jsonify([{"id": r.student_id, "username": r.username, "firstname": r.firstname,
+                     "lastname": r.lastname, "email": r.email, "mobile_no": r.mobile_no or "",
+                     "gender": r.gender or "", "dob": r.dob.isoformat() if r.dob else "",
+                     "city": r.city} for r in rows])
+
+@app.route("/api/admin/student-list", methods=["POST"])
+@admin
+def admin_student_create():
+    v, err = clean_student(request.get_json(silent=True) or {}, creating=True)
+    if err:
+        return jsonify(success=False, message=err), 400
+
+    # Auto-generate Username and Password
+    v["username"] = v["email"]
+    birth_year = v["dob"].strftime("%Y") if v["dob"] else "2000"
+    v["password"] = v["firstname"] + birth_year
+
+    def work(cur):
+        cur.execute("SELECT 1 FROM users WHERE username=%s", (v["username"],))
+        if cur.fetchone():
+            raise psycopg2.IntegrityError("Username exists")
+
+        cur.execute("INSERT INTO users (username, password_hash, role) "
+                    "VALUES (%s, %s, 'Student') RETURNING user_id",
+                    (v["username"], hash_pw(v["password"])))
+        uid = cur.fetchone()[0]
+
+        cur.execute("INSERT INTO Student (user_id, firstname, lastname, email, mobile_no, gender, dob, city) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (uid, v["firstname"], v["lastname"], v["email"], v["mobile_no"] or None,
+                     v["gender"] or None, v["dob"], v["city"]))
+    try:
+        run_tx(work)
+    except psycopg2.IntegrityError:
+        return jsonify(success=False, message="That email address is already registered."), 400
+    
+    # --- SEND EMAIL WITH CREDENTIALS ---
+    # Run email in background so the "Save" button doesn't freeze
+    threading.Thread(target=send_student_credentials, args=(v["email"], v["firstname"], v["password"])).start()
+    return jsonify(success=True)
+
+@app.route("/api/admin/student-list/<int:sid>", methods=["PUT"])
+@admin
+def admin_student_update(sid):
+    v, err = clean_student(request.get_json(silent=True) or {}, creating=False)
+    if err:
+        return jsonify(success=False, message=err), 400
+
+    # Auto-update Username to match Email
+    v["username"] = v["email"]
+
+    # --- NEW PASSWORD LOGIC ---
+    # Recalculate password based on the NEW firstname and NEW birth year
+    birth_year = v["dob"].strftime("%Y") if v["dob"] else "2000"
+    new_password = v["firstname"] + birth_year
+    new_password_hash = hash_pw(new_password)
+    # --------------------------
+
+    def work(cur):
+        # Update BOTH username and password_hash in the users table
+        cur.execute("""
+            UPDATE users 
+            SET username=%s, password_hash=%s 
+            WHERE user_id=(SELECT user_id FROM Student WHERE student_id=%s)
+        """, (v["username"], new_password_hash, sid))
+
+        # Update Student details
+        cur.execute("""
+            UPDATE Student 
+            SET firstname=%s, lastname=%s, email=%s, mobile_no=%s, gender=%s, 
+                dob=%s, city=%s 
+            WHERE student_id=%s
+        """, (v["firstname"], v["lastname"], v["email"], v["mobile_no"] or None,
+              v["gender"] or None, v["dob"], v["city"], sid))
+
+        if cur.rowcount == 0:
+            return False
+        return True
 
     try:
+        found = run_tx(work)
+    except psycopg2.IntegrityError:
+        return jsonify(success=False, message="That email already exists."), 400
+        
+    if not found:
+        return jsonify(success=False, message="Student not found."), 404
+        
+    # Return the new password so the Admin can see it in the network tab or console if needed
+    return jsonify(success=True, new_password=new_password)
 
-        print("\n" + "=" * 80)
-        print("QUESTION:")
-        print(request.question)
+@app.route("/api/admin/student-list/<int:sid>", methods=["DELETE"])
+@admin
+def admin_student_delete(sid):
+    n = run("DELETE FROM users WHERE user_id=(SELECT user_id FROM Student WHERE student_id=%s)", (sid,))
+    if not n:
+        return jsonify(success=False, message="Student not found."), 404
+    return jsonify(success=True)
 
-        sql = generate_sql(request.question)
-
-        print("\nGENERATED SQL:")
-        print(sql)
-
-        result = execute_sql(sql)
-
-        print("\nQUERY STATUS:")
-        print(result.get("success"))
-
-        if not result.get("success"):
-
-            return {
-                "success": False,
-                "question": request.question,
-                "generated_sql": sql,
-                "error": result.get("error")
-            }
-
-        return {
-            "success": True,
-            "question": request.question,
-            "generated_sql": sql,
-            "count": result.get("count", 0),
-            "rows": result.get("rows", [])
-        }
-
-    except Exception as e:
-
-        print("\nASK AI ERROR:")
-        print(str(e))
-
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-
-# =====================================================
-# TEST API
-# =====================================================
-
-@app.get("/test")
-def test():
-
-    return {
-        "success": True,
-        "message": "API Running Successfully"
-    }
+if __name__ == "__main__":
+    app.run(debug=True)

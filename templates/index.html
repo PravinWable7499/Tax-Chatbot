@@ -1,11 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
 
-fastapi
-uvicorn[standard]
-jinja2
-python-multipart
-python-dotenv
-pandas
-psycopg2-binary
-google-generativeai
-sqlalchemy
-openpyxl
+<head>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>Property Tax AI Assistant</title>
+
+    <style>
+
+        *{
+            margin:0;
+            padding:0;
+            box-sizing:border-box;
+            font-family:Arial, sans-serif;
+        }
+
+        body{
+            background:#f4f6f9;
+            padding:30px;
+        }
+
+        .container{
+            max-width:1400px;
+            margin:auto;
+            background:white;
+            padding:25px;
+            border-radius:10px;
+            box-shadow:0 0 10px rgba(0,0,0,0.1);
+        }
+
+        h1{
+            text-align:center;
+            color:#2c3e50;
+            margin-bottom:20px;
+        }
+
+        textarea{
+            width:100%;
+            height:120px;
+            padding:15px;
+            border:1px solid #ccc;
+            border-radius:6px;
+            font-size:16px;
+        }
+
+        button{
+            margin-top:15px;
+            width:100%;
+            padding:12px;
+            border:none;
+            background:#007bff;
+            color:white;
+            font-size:18px;
+            border-radius:6px;
+            cursor:pointer;
+        }
+
+        button:hover{
+            background:#0056b3;
+        }
+
+        .loading{
+            display:none;
+            margin-top:15px;
+            color:#007bff;
+            font-weight:bold;
+        }
+
+        .card{
+            margin-top:25px;
+            padding:15px;
+            background:#f8f9fa;
+            border-radius:8px;
+        }
+
+        .sql-box{
+            background:#272822;
+            color:#00ff99;
+            padding:15px;
+            border-radius:6px;
+            overflow:auto;
+            white-space:pre-wrap;
+        }
+
+        table{
+            width:100%;
+            border-collapse:collapse;
+            margin-top:15px;
+        }
+
+        th{
+            background:#007bff;
+            color:white;
+        }
+
+        th,td{
+            border:1px solid #ddd;
+            padding:8px;
+            text-align:left;
+        }
+
+        tr:nth-child(even){
+            background:#f2f2f2;
+        }
+
+        .error{
+            background:#ffe5e5;
+            color:red;
+            padding:15px;
+            border-radius:6px;
+            margin-top:20px;
+        }
+
+        .count-box{
+            margin-top:15px;
+            font-size:18px;
+            font-weight:bold;
+            color:green;
+        }
+
+    </style>
+
+</head>
+
+<body>
+
+<div class="container">
+
+    <h1>🏠 Property Tax AI Assistant</h1>
+
+    <textarea
+        id="question"
+        placeholder="Ask anything...
+Example:
+Top 10 pending properties
+Commercial properties
+Penalty above 50000
+Owners without mobile number">
+    </textarea>
+
+    <button onclick="askAI()">
+        Ask AI
+    </button>
+
+    <div class="loading" id="loading">
+        Generating SQL and Fetching Data...
+    </div>
+
+    <div id="error"></div>
+
+    <div id="sqlSection"></div>
+
+    <div id="countSection"></div>
+
+    <div id="tableSection"></div>
+
+</div>
+
+<script>
+
+async function askAI(){
+
+    let question = document.getElementById("question").value;
+
+    if(question.trim()===""){
+        alert("Please enter question");
+        return;
+    }
+
+    document.getElementById("loading").style.display="block";
+
+    document.getElementById("error").innerHTML="";
+    document.getElementById("sqlSection").innerHTML="";
+    document.getElementById("countSection").innerHTML="";
+    document.getElementById("tableSection").innerHTML="";
+
+    try{
+
+        const response = await fetch("/ask",{
+
+            method:"POST",
+
+            headers:{
+                "Content-Type":"application/json"
+            },
+
+            body:JSON.stringify({
+                question:question
+            })
+
+        });
+
+        const data = await response.json();
+
+        document.getElementById("loading").style.display="none";
+
+        if(data.success===false){
+
+            document.getElementById("error").innerHTML=
+            `<div class="error">${data.error}</div>`;
+
+            return;
+        }
+
+        document.getElementById("sqlSection").innerHTML=`
+            <div class="card">
+                <h3>Generated SQL</h3>
+                <div class="sql-box">${data.generated_sql}</div>
+            </div>
+        `;
+
+        document.getElementById("countSection").innerHTML=`
+            <div class="count-box">
+                Total Records : ${data.count}
+            </div>
+        `;
+
+        let rows = data.rows;
+
+        if(rows.length===0){
+
+            document.getElementById("tableSection").innerHTML=`
+                <div class="card">
+                    No Records Found
+                </div>
+            `;
+
+            return;
+        }
+
+        let columns = Object.keys(rows[0]);
+
+        let table = "<table><thead><tr>";
+
+        columns.forEach(col=>{
+            table += `<th>${col}</th>`;
+        });
+
+        table += "</tr></thead><tbody>";
+
+        rows.forEach(row=>{
+
+            table += "<tr>";
+
+            columns.forEach(col=>{
+
+                table += `<td>${row[col] ?? ""}</td>`;
+
+            });
+
+            table += "</tr>";
+
+        });
+
+        table += "</tbody></table>";
+
+        document.getElementById("tableSection").innerHTML=`
+            <div class="card">
+                <h3>Results</h3>
+                ${table}
+            </div>
+        `;
+
+    }
+    catch(error){
+
+        document.getElementById("loading").style.display="none";
+
+        document.getElementById("error").innerHTML=
+        `<div class="error">${error}</div>`;
+    }
+}
+
+</script>
+
+</body>
+</html>

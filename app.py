@@ -2008,9 +2008,9 @@ async def home(request: Request):
 
 @app.get("/health")
 def health():
+
     return {
-        "status": "healthy",
-        "message": "Gemini Tax Dashboard is running"
+        "status": "running"
     }
 
 # =====================================================
